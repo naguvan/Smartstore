@@ -10,12 +10,14 @@ using Microsoft.Extensions.Logging.Abstractions;
 using Smartstore.Core.Catalog.Attributes;
 using Smartstore.Core.Checkout.Attributes;
 using Smartstore.Core.Checkout.Cart;
+using Smartstore.Core.Checkout.GiftCards;
 using Smartstore.Core.Common;
 using Smartstore.Core.Configuration;
 using Smartstore.Core.Data;
 using Smartstore.Core.Localization;
 using Smartstore.Core.Stores;
 using Smartstore.Data;
+using Smartstore.Domain;
 using Smartstore.Engine.Modularity;
 
 namespace Smartstore.Core.Checkout.Shipping
@@ -24,7 +26,6 @@ namespace Smartstore.Core.Checkout.Shipping
     public partial class ShippingService : IShippingService
     {
         private readonly ICheckoutAttributeMaterializer _checkoutAttributeMaterializer;
-        private readonly IProductAttributeMaterializer _productAttributeMaterializer;
         //private readonly ICartRuleProvider _cartRuleProvider;
         private readonly ShippingSettings _shippingSettings;
         private readonly IProviderManager _providerManager;
@@ -34,7 +35,6 @@ namespace Smartstore.Core.Checkout.Shipping
 
         public ShippingService(
             ICheckoutAttributeMaterializer checkoutAttributeMaterializer,
-            IProductAttributeMaterializer productAttributeMaterializer,
             //ICartRuleProvider cartRuleProvider,
             ShippingSettings shippingSettings,
             IProviderManager providerManager,
@@ -43,7 +43,6 @@ namespace Smartstore.Core.Checkout.Shipping
             SmartDbContext db)
         {
             _checkoutAttributeMaterializer = checkoutAttributeMaterializer;
-            _productAttributeMaterializer = productAttributeMaterializer;
             //_cartRuleProvider = cartRuleProvider;
             _shippingSettings = shippingSettings;
             _providerManager = providerManager;
@@ -65,9 +64,12 @@ namespace Smartstore.Core.Checkout.Shipping
                 .Select(x => x.Item.RawAttributes);
 
             var selection = new ProductVariantAttributeSelection(string.Empty);
-            foreach (var rawAttribute in rawAttributes)
+            foreach (var cartItem in cart)
             {
-                var attributeSelection = new ProductVariantAttributeSelection(rawAttribute);
+                if (cartItem.Item.RawAttributes.IsEmpty() || cartItem.Item.Product.IsGiftCard)
+                    continue;
+
+                var attributeSelection = new ProductVariantAttributeSelection(cartItem.Item.RawAttributes);
                 foreach (var attribute in attributeSelection.AttributesMap)
                 {
                     if (attribute.Value.IsNullOrEmpty())
@@ -145,6 +147,7 @@ namespace Smartstore.Core.Checkout.Shipping
                 .ToListAsync();
 
             return activeShippingMethods;
+            // TODO: (ms) (core) need cart rules to finish implementation
             //return activeShippingMethods.Where(s =>
             //{
             //    // Rule sets.
@@ -200,7 +203,6 @@ namespace Smartstore.Core.Checkout.Shipping
             return cartTotalWeight;
         }
 
-
         public virtual ShippingOptionRequest CreateShippingOptionRequest(IList<OrganizedShoppingCartItem> cart, Address shippingAddress, int storeId)
         {
             var shipping = cart.Where(x => x.Item.IsShippingEnabled);
@@ -220,33 +222,24 @@ namespace Smartstore.Core.Checkout.Shipping
         }
 
         public virtual ShippingOptionResponse GetShippingOptions(
-            IList<OrganizedShoppingCartItem> cart,
-            Address shippingAddress,
-            string computationMethodSystemName = "",
-            int storeId = 0)
+            ShippingOptionRequest shippingOptionRequest, 
+            string allowedShippingRateComputationMethodSystemName = "")
         {
-            Guard.NotNull(cart, nameof(cart));
+            Guard.NotNull(shippingOptionRequest, nameof(shippingOptionRequest));
 
-            var computationMethods = LoadActiveShippingRateComputationMethods(storeId)
-                .Where(x => computationMethodSystemName.IsEmpty() || computationMethodSystemName == x.Metadata.SystemName)
+            var computationMethods = LoadActiveShippingRateComputationMethods(shippingOptionRequest.StoreId)
+                .Where(x => allowedShippingRateComputationMethodSystemName.IsEmpty() 
+                || allowedShippingRateComputationMethodSystemName == x.Metadata.SystemName)
                 .ToList();
 
             if (computationMethods.IsNullOrEmpty())
                 throw new SmartException(T("Shipping.CouldNotLoadMethod"));
 
-            var request = new ShippingOptionRequest
-            {
-                StoreId = storeId,
-                ShippingAddress = shippingAddress,
-                Customer = cart.GetCustomer(),
-                Items = cart.Where(x => x.Item.IsShippingEnabled).ToList()
-            };
-
             // Get shipping options
             var result = new ShippingOptionResponse();
             foreach (var method in computationMethods)
             {
-                var response = method.Value.GetShippingOptions(request);
+                var response = method.Value.GetShippingOptions(shippingOptionRequest);
                 foreach (var option in response.ShippingOptions)
                 {
                     option.ShippingRateComputationMethodSystemName = method.Metadata.SystemName;
@@ -260,8 +253,8 @@ namespace Smartstore.Core.Checkout.Shipping
                 {
                     foreach (var error in response.Errors)
                     {
-                        result.AddError(error);
-                        if (!request.Items.IsNullOrEmpty())
+                        result.Errors.Add(error);
+                        if (!shippingOptionRequest.Items.IsNullOrEmpty())
                         {
                             Logger.Warn(error);
                         }
@@ -270,13 +263,13 @@ namespace Smartstore.Core.Checkout.Shipping
             }
 
             // Return valid options if any present (ignores the errors returned by other shipping rate compuation methods)
-            if (_shippingSettings.ReturnValidOptionsIfThereAreAny && result.ShippingOptions.Count > 0 && result.Errors.Count > 0)
+            if (_shippingSettings.ReturnValidOptionsIfThereAreAny && result.ShippingOptions.Count > 0 && !result.Success)
             {
                 result.Errors.Clear();
             }
 
             // No shipping options loaded
-            if (result.ShippingOptions.Count == 0 && result.Errors.Count == 0)
+            if (result.ShippingOptions.Count == 0 && result.Success)
             {
                 result.Errors.Add(T("Checkout.ShippingOptionCouldNotBeLoaded"));
             }

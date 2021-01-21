@@ -1,9 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Diagnostics;
-using System.Globalization;
 using System.Linq;
-using System.Text;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
@@ -12,21 +9,19 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Net.Http.Headers;
 using Smartstore.Core.Content.Media.Imaging;
-using Smartstore.Core.Customers;
 using Smartstore.Core.Security;
 using Smartstore.Events;
 using Smartstore.IO;
+using Smartstore.Net;
 
 namespace Smartstore.Core.Content.Media
 {
     public class MediaMiddleware
     {
-        private readonly RequestDelegate _next;
         private readonly IEventPublisher _eventPublisher;
 
         public MediaMiddleware(RequestDelegate next, IEventPublisher eventPublisher)
         {
-            _next = next;
             _eventPublisher = eventPublisher;
         }
 
@@ -41,8 +36,8 @@ namespace Smartstore.Core.Content.Media
             Lazy<IEnumerable<IMediaHandler>> mediaHandlers,
             ILogger<MediaMiddleware> logger)
         {
-            var mediaFileId = context.GetRouteValue("id")?.Convert<int>() ?? 0;
-            var path = context.GetRouteValue("path")?.Convert<string>();
+            var mediaFileId = context.GetRouteValueAs<int>("id");
+            var path = context.GetRouteValueAs<string>("path");
 
             if (context.Request.Method != HttpMethods.Get && context.Request.Method != HttpMethods.Head)
             {
@@ -155,7 +150,7 @@ namespace Smartstore.Core.Content.Media
                 var fileResult = CreateFileResult(responseFile, pathData);
 
                 // Cache control
-                ApplyResponseCaching(context);
+                ApplyResponseCaching(context, mediaSettings);
 
                 // INFO: Although we are outside of the MVC pipeline we gonna use ActionContext anyway, because "FileStreamResult"
                 // does everything we need (ByteRange, ETag etc.), so wo we gonna use it instead of reinventing the wheel.
@@ -166,7 +161,7 @@ namespace Smartstore.Core.Content.Media
             finally
             {
                 var imageProcessor = context.RequestServices.GetRequiredService<IImageProcessor>();
-                Debug.WriteLine("ImageProcessor TOTAL: {0} ms.".FormatCurrent(imageProcessor.TotalProcessingTimeMs));
+                logger.Debug("ImageProcessor TOTAL: {0} ms.", imageProcessor.TotalProcessingTimeMs);
             }
 
             #region Functions
@@ -199,20 +194,60 @@ namespace Smartstore.Core.Content.Media
             return new FileStreamResult(file.OpenRead(), pathData.MimeType)
             {
                 EnableRangeProcessing = true,
-                LastModified = file.LastModified,
-                EntityTag = GenerateETag(file)
+                // INFO: (core)(perf)I think ETag is sufficient and ignoring this reduces header comparison by one item.
+                //LastModified = file.LastModified,
+                EntityTag = new EntityTagHeaderValue('\"' + ETagUtility.GenerateETag(file) + '\"')
             };
         }
 
-        private static EntityTagHeaderValue GenerateETag(IFile file)
+        private static void ApplyResponseCaching(HttpContext context, MediaSettings mediaSettings)
         {
-            // TODO: (core) Make extension methods for IFile, FileInfo etc.
-            var len = file.Length;
-            var last = file.LastModified;
-            var lastModified = new DateTimeOffset(last.Year, last.Month, last.Day, last.Hour, last.Minute, last.Second, last.Offset).ToUniversalTime();
-            long etagHash = lastModified.ToFileTime() ^ len;
+            var headers = context.Response.Headers;
 
-            return new EntityTagHeaderValue('\"' + Convert.ToString(etagHash, 16) + '\"');
+            // Clear current cache headers
+            headers.Remove(HeaderNames.CacheControl);
+            headers.Remove(HeaderNames.Pragma);
+
+            if (mediaSettings.ResponseCacheNoStore)
+            {
+                headers[HeaderNames.CacheControl] = "no-store";
+
+                // Cache-control: no-store, no-cache is valid.
+                if (mediaSettings.ResponseCacheLocation == ResponseCacheLocation.None)
+                {
+                    headers.AppendCommaSeparatedValues(HeaderNames.CacheControl, "no-cache");
+                    headers[HeaderNames.Pragma] = "no-cache";
+                }
+            }
+            else
+            {
+                string cacheControlValue;
+                switch (mediaSettings.ResponseCacheLocation)
+                {
+                    case ResponseCacheLocation.Any:
+                        cacheControlValue = "public,";
+                        break;
+                    case ResponseCacheLocation.Client:
+                        cacheControlValue = "private,";
+                        break;
+                    case ResponseCacheLocation.None:
+                        cacheControlValue = "no-cache,";
+                        headers[HeaderNames.Pragma] = "no-cache";
+                        break;
+                    default:
+                        cacheControlValue = null;
+                        break;
+                }
+
+                var duration = mediaSettings.ResponseCacheDuration;
+                if (duration <= 0)
+                {
+                    duration = 60; // 1 minute.
+                }
+
+                cacheControlValue = $"{cacheControlValue}max-age={duration}";
+                headers[HeaderNames.CacheControl] = cacheControlValue;
+            }
         }
 
         private async Task<ProcessImageQuery> CreateImageQuery(HttpContext context, string mimeType, string extension)
@@ -238,17 +273,6 @@ namespace Smartstore.Core.Content.Media
             await _eventPublisher.PublishAsync(new ImageQueryCreatedEvent(query, context, mimeType, extension));
 
             return query;
-        }
-
-        private static void ApplyResponseCaching(HttpContext context)
-        {
-            // TODO: (core) cache-control for media files from config
-            context.Response.GetTypedHeaders().CacheControl = new CacheControlHeaderValue
-            {
-                Public = true,
-                MustRevalidate = true,
-                MaxAge = TimeSpan.FromSeconds(60000)
-            };
         }
     }
 }

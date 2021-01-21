@@ -3,6 +3,7 @@ using Autofac;
 using Microsoft.Extensions.DependencyInjection;
 using Smartstore.ComponentModel;
 using Smartstore.Core.Catalog.Products;
+using Smartstore.Core.Checkout.GiftCards;
 using Smartstore.Core.Checkout.Shipping;
 using Smartstore.Core.Data;
 using Smartstore.Core.DependencyInjection;
@@ -46,6 +47,11 @@ namespace Smartstore.Core
             TypeConverterFactory.RegisterConverter<IList<ProductBundleItemOrderData>>(converter);
             TypeConverterFactory.RegisterConverter<List<ProductBundleItemOrderData>>(converter);
             TypeConverterFactory.RegisterConverter<ProductBundleItemOrderData>(new ProductBundleItemOrderDataConverter(false));
+
+            converter = new GiftCardCouponCodeConverter();
+            TypeConverterFactory.RegisterConverter<IList<string>>(converter);
+            TypeConverterFactory.RegisterConverter<List<string>>(converter);
+            TypeConverterFactory.RegisterConverter<string>(new GiftCardCouponCodeConverter());
         }
 
         public override void ConfigureContainer(ContainerBuilder builder, IApplicationContext appContext, bool isActiveModule)
@@ -58,12 +64,10 @@ namespace Smartstore.Core
 
             if (appContext.IsInstalled)
             {
-                builder.RegisterModule(new SeoModule());
                 builder.RegisterModule(new DbHooksModule(appContext));
                 builder.RegisterModule(new StoresModule());
                 builder.RegisterModule(new CustomersModule());
                 builder.RegisterModule(new RuleModule());
-                builder.RegisterModule(new MessagingModule());
                 builder.RegisterModule(new CatalogModule());
                 builder.RegisterModule(new CheckoutModule());
             }

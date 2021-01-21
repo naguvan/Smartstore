@@ -108,16 +108,15 @@ namespace Smartstore.Core.Security
         private readonly ILocalizationService _localizationService;
         private readonly ICacheManager _cache;
 
-        // TODO: (core) Fix dependency exception in PermissionService ctor caused by early Autofac registration in SecurityStarter.
         public PermissionService(
             SmartDbContext db,
-            //IWorkContext workContext,
-            //ILocalizationService localizationService,
+            IWorkContext workContext,
+            ILocalizationService localizationService,
             ICacheManager cache)
         {
             _db = db;
-            //_workContext = workContext;
-            //_localizationService = localizationService;
+            _workContext = workContext;
+            _localizationService = localizationService;
             _cache = cache;
         }
 
@@ -131,22 +130,20 @@ namespace Smartstore.Core.Security
         public bool Authorize(string permissionSystemName, Customer customer)
         {
             // TODO: (mg) (core) Really absolutely sure to do the whole authorization thing again in sync (see GetPermissionTreeAsync(CustomerRole))?
+            // TODO: (mg) (core) (info) Yes, because low-level stuff should also have a sync counterpart and permission tree comes from cache most of the time.
             return true;
         }
 
-        public async Task<bool> AuthorizeAsync(string permissionSystemName)
+        public async Task<bool> AuthorizeAsync(string permissionSystemName, Customer customer = null, bool allowByChildPermission = false)
         {
-            return await AuthorizeAsync(permissionSystemName, _workContext.CurrentCustomer);
-        }
-
-        public async Task<bool> AuthorizeAsync(string permissionSystemName, Customer customer)
-        {
-            if (customer == null || string.IsNullOrEmpty(permissionSystemName))
+            if (string.IsNullOrEmpty(permissionSystemName))
             {
                 return false;
             }
 
-            var cacheKey = "permission." + customer.Id.ToString() + "." + permissionSystemName;
+            customer ??= _workContext.CurrentCustomer;
+
+            var cacheKey = $"permission.{customer.Id}.{allowByChildPermission}.{permissionSystemName}";
 
             var authorized = await _cache.GetAsync(cacheKey, async o =>
             {
@@ -166,10 +163,16 @@ namespace Smartstore.Core.Security
                         continue;
                     }
 
+                    if (allowByChildPermission && FindAllowByChild(node))
+                    {
+                        return true;
+                    }
+
                     while (node != null && !node.Value.Allow.HasValue)
                     {
                         node = node.Parent;
                     }
+
                     if (node?.Value?.Allow ?? false)
                     {
                         return true;
@@ -180,6 +183,27 @@ namespace Smartstore.Core.Security
             });
 
             return authorized;
+
+            static bool FindAllowByChild(TreeNode<IPermissionNode> n)
+            {
+                if (n?.Value?.Allow ?? false)
+                {
+                    return true;
+                }
+
+                if (n.HasChildren)
+                {
+                    foreach (var child in n.Children)
+                    {
+                        if (FindAllowByChild(child))
+                        {
+                            return true;
+                        }
+                    }
+                }
+
+                return false;
+            }
         }
 
         public async Task<bool> AuthorizeByAliasAsync(string permissionSystemName)
@@ -224,70 +248,6 @@ namespace Smartstore.Core.Security
             return true;
         }
 
-        public async Task<bool> FindAuthorizationAsync(string permissionSystemName)
-        {
-            return await FindAuthorizationAsync(permissionSystemName, _workContext.CurrentCustomer);
-        }
-
-        public async Task<bool> FindAuthorizationAsync(string permissionSystemName, Customer customer)
-        {
-            if (string.IsNullOrEmpty(permissionSystemName))
-            {
-                return false;
-            }
-
-            var roles = customer.CustomerRoleMappings
-                .Select(x => x.CustomerRole)
-                .Where(x => x.Active);
-
-            foreach (var role in roles)
-            {
-                var tree = await GetPermissionTreeAsync(role);
-                var node = tree.SelectNodeById(permissionSystemName);
-                if (node == null)
-                {
-                    continue;
-                }
-
-                if (FindAllowByChild(node))
-                {
-                    return true;
-                }
-
-                while (node != null && !node.Value.Allow.HasValue)
-                {
-                    node = node.Parent;
-                }
-                if (node?.Value?.Allow ?? false)
-                {
-                    return true;
-                }
-            }
-
-            return false;
-
-            static bool FindAllowByChild(TreeNode<IPermissionNode> n)
-            {
-                if (n?.Value?.Allow ?? false)
-                {
-                    return true;
-                }
-
-                if (n.HasChildren)
-                {
-                    foreach (var child in n.Children)
-                    {
-                        if (FindAllowByChild(child))
-                        {
-                            return true;
-                        }
-                    }
-                }
-
-                return false;
-            }
-        }
-
         public async Task<TreeNode<IPermissionNode>> GetPermissionTreeAsync(CustomerRole role, bool addDisplayNames = false)
         {
             Guard.NotNull(role, nameof(role));
@@ -296,51 +256,41 @@ namespace Smartstore.Core.Security
             {
                 var root = new TreeNode<IPermissionNode>(new PermissionNode());
 
-                var permissions = await _db.PermissionRecords
+                var allPermissions = await _db.PermissionRecords
                     .AsNoTracking()
                     .Include(x => x.PermissionRoleMappings)
                     .ToListAsync();
 
-                await AddChildItems(root, permissions, null, permission =>
-                {
-                    // TODO: (mg) (core) PermissionService.AddChildItems looks like it has to be refactored (if possible).
-                    var mapping = permission.PermissionRoleMappings.FirstOrDefault(x => x.CustomerRoleId == role.Id);
-
-                    return Task.FromResult(mapping?.Allow ?? null);
-                });
+                await AddPermissions(root, GetChildren(null, allPermissions), allPermissions, null, role);
 
                 return root;
             });
 
             if (addDisplayNames)
             {
-                var language = _workContext.WorkingLanguage;
-                var resourcesLookup = await GetDisplayNameLookup(language.Id);
-                await AddDisplayName(result, language.Id, resourcesLookup);
+                // Adds the localized display name to permission nodes as thread metadata. Only required for backend.
+                var resourcesLookup = await GetDisplayNameLookup(_workContext.WorkingLanguage.Id);
+                AddDisplayNames(result, resourcesLookup);
             }
 
             return result;
         }
 
-        public async Task<TreeNode<IPermissionNode>> GetPermissionTreeAsync(Customer customer, bool addDisplayNames = false)
+        public async Task<TreeNode<IPermissionNode>> BuildCustomerPermissionTreeAsync(Customer customer, bool addDisplayNames = false)
         {
             Guard.NotNull(customer, nameof(customer));
 
             var root = new TreeNode<IPermissionNode>(new PermissionNode());
-            var permissions = await _db.PermissionRecords
+            var allPermissions = await _db.PermissionRecords
                 .AsNoTracking()
                 .ToListAsync();
 
-            await AddChildItems(root, permissions, null, async permission =>
-            {
-                return await AuthorizeAsync(permission.SystemName, customer);
-            });
+            await AddPermissions(root, GetChildren(null, allPermissions), allPermissions, customer, null);
 
             if (addDisplayNames)
             {
-                var language = _workContext.WorkingLanguage;
-                var resourcesLookup = await GetDisplayNameLookup(language.Id);
-                await AddDisplayName(root, language.Id, resourcesLookup);
+                var resourcesLookup = await GetDisplayNameLookup(_workContext.WorkingLanguage.Id);
+                AddDisplayNames(root, resourcesLookup);
             }
 
             return root;
@@ -349,8 +299,7 @@ namespace Smartstore.Core.Security
         public async Task<Dictionary<string, string>> GetAllSystemNamesAsync()
         {
             var result = new Dictionary<string, string>();
-            var language = _workContext.WorkingLanguage;
-            var resourcesLookup = await GetDisplayNameLookup(language.Id);
+            var resourcesLookup = await GetDisplayNameLookup(_workContext.WorkingLanguage.Id);
 
             var systemNames = await _db.PermissionRecords
                 .AsQueryable()
@@ -362,7 +311,7 @@ namespace Smartstore.Core.Security
                 var safeSytemName = systemName.EmptyNull().ToLower();
                 var tokens = safeSytemName.Split(new char[] { '.' }, StringSplitOptions.RemoveEmptyEntries);
 
-                result[safeSytemName] = await GetDisplayName(tokens, language.Id, resourcesLookup);
+                result[safeSytemName] = GetDisplayName(tokens, resourcesLookup);
             }
 
             return result;
@@ -373,10 +322,9 @@ namespace Smartstore.Core.Security
             var tokens = permissionSystemName.EmptyNull().ToLower().Split(new char[] { '.' }, StringSplitOptions.RemoveEmptyEntries);
             if (tokens.Any())
             {
-                var language = _workContext.WorkingLanguage;
-                var resourcesLookup = await GetDisplayNameLookup(language.Id);
+                var resourcesLookup = await GetDisplayNameLookup(_workContext.WorkingLanguage.Id);
 
-                return await GetDisplayName(tokens, language.Id, resourcesLookup);
+                return GetDisplayName(tokens, resourcesLookup);
             }
 
             return string.Empty;
@@ -545,57 +493,73 @@ namespace Smartstore.Core.Security
 
         #region Utilities
 
-        // TODO: (mg) (core) PermissionService.AddChildItems looks like it has to be refactored (if possible).
-        private async Task AddChildItems(TreeNode<IPermissionNode> parentNode, List<PermissionRecord> permissions, string path, Func<PermissionRecord, Task<bool?>> allow)
+        private static IEnumerable<PermissionRecord> GetChildren(PermissionRecord permission, IEnumerable<PermissionRecord> allPermissions)
         {
-            if (parentNode == null)
+            if (permission == null)
             {
-                return;
-            }
-
-            IEnumerable<PermissionRecord> entities = null;
-
-            if (path == null)
-            {
-                entities = permissions.Where(x => !x.SystemName.Contains('.'));
+                // Get root permissions.
+                return allPermissions.Where(x => !x.SystemName.Contains('.'));
             }
             else
             {
-                var tmpPath = path.EnsureEndsWith(".");
-                entities = permissions.Where(x => x.SystemName.StartsWith(tmpPath) && x.SystemName.IndexOf('.', tmpPath.Length) == -1);
-            }
+                // Get children.
+                var tmpPath = permission.SystemName.EnsureEndsWith(".");
 
-            foreach (var entity in entities)
-            {
-                var newNode = parentNode.Append(new PermissionNode
-                {
-                    PermissionRecordId = entity.Id,
-                    Allow = await allow(entity),  // null = inherit
-                    SystemName = entity.SystemName
-                }, entity.SystemName);
-
-                await AddChildItems(newNode, permissions, entity.SystemName, allow);
+                return allPermissions.Where(x => x.SystemName.StartsWith(tmpPath) && x.SystemName.IndexOf('.', tmpPath.Length) == -1);
             }
         }
 
-        private async Task AddDisplayName(TreeNode<IPermissionNode> node, int languageId, Dictionary<string, string> resourcesLookup)
+        private async Task AddPermissions(
+            TreeNode<IPermissionNode> parent,
+            IEnumerable<PermissionRecord> toAdd,
+            List<PermissionRecord> allPermissions,
+            Customer customer,
+            CustomerRole role)
+        {
+            foreach (var entity in toAdd)
+            {
+                // null = inherit
+                bool? allow = null;
+
+                if (role != null)
+                {
+                    var mapping = entity.PermissionRoleMappings.FirstOrDefault(x => x.CustomerRoleId == role.Id);
+                    allow = mapping?.Allow ?? null;
+                }
+                else
+                {
+                    allow = await AuthorizeAsync(entity.SystemName, customer);
+                }                
+
+                var newNode = parent.Append(new PermissionNode
+                {
+                    PermissionRecordId = entity.Id,
+                    Allow = allow,
+                    SystemName = entity.SystemName
+                }, entity.SystemName);
+
+                await AddPermissions(newNode, GetChildren(entity, allPermissions), allPermissions, customer, role);
+            }
+        }
+
+        private static void AddDisplayNames(TreeNode<IPermissionNode> node, Dictionary<string, string> resourcesLookup)
         {
             var tokens = node.Value.SystemName.EmptyNull().ToLower().Split(new char[] { '.' }, StringSplitOptions.RemoveEmptyEntries);
             var token = tokens.LastOrDefault();
-            var displayName = (await GetDisplayName(token, languageId, resourcesLookup)) ?? token ?? node.Value.SystemName;
+            var displayName = GetDisplayName(token, resourcesLookup);
 
-            node.SetThreadMetadata("DisplayName", displayName);
+            node.SetThreadMetadata("DisplayName", displayName ?? token ?? node.Value.SystemName);
 
             if (node.HasChildren)
             {
                 foreach (var children in node.Children)
                 {
-                    await AddDisplayName(children, languageId, resourcesLookup);
+                    AddDisplayNames(children, resourcesLookup);
                 }
             }
         }
 
-        private async Task<string> GetDisplayName(string[] tokens, int languageId, Dictionary<string, string> resourcesLookup)
+        private static string GetDisplayName(string[] tokens, Dictionary<string, string> resourcesLookup)
         {
             var displayName = string.Empty;
 
@@ -608,32 +572,37 @@ namespace Smartstore.Core.Security
                         displayName += " » ";
                     }
 
-                    displayName += (await GetDisplayName(token, languageId, resourcesLookup)) ?? token ?? string.Empty;
+                    displayName += GetDisplayName(token, resourcesLookup) ?? token ?? string.Empty;
                 }
             }
 
             return displayName;
         }
 
-        private async Task<string> GetDisplayName(string token, int languageId, Dictionary<string, string> resourcesLookup)
+        private static string GetDisplayName(string token, Dictionary<string, string> resourcesLookup)
         {
-            if (!string.IsNullOrWhiteSpace(token))
+            if (string.IsNullOrWhiteSpace(token))
             {
-                // Try known token of default permissions.
-                if (!_displayNameResourceKeys.TryGetValue(token, out var key) || !resourcesLookup.TryGetValue(key, out var name))
-                {
-                    // Unknown token. Try to find resource by name convention.
-                    key = "Permissions.DisplayName." + token.Replace("-", "");
+                return null;
+            }
 
-                    // Try resource provided by core.
-                    name = await _localizationService.GetResourceAsync(key, languageId, false, string.Empty, true);
-                    if (name.IsEmpty())
-                    {
-                        // Try resource provided by plugin.
-                        name = await _localizationService.GetResourceAsync("Plugins." + key, languageId, false, string.Empty, true);
-                    }
-                }
+            // Try known token of default permissions.
+            if (_displayNameResourceKeys.TryGetValue(token, out string key) && resourcesLookup.TryGetValue(key, out string name))
+            {
+                return name;
+            }
 
+            // Unknown token. Try to find resource by name convention.
+            key = "Permissions.DisplayName." + token.Replace("-", "");
+            if (resourcesLookup.TryGetValue(key, out name))
+            {
+                return name;
+            }
+
+            // Try resource provided by plugin.
+            key = "Plugins." + key;
+            if (resourcesLookup.TryGetValue(key, out name))
+            {
                 return name;
             }
 
@@ -642,16 +611,23 @@ namespace Smartstore.Core.Security
 
         private async Task<Dictionary<string, string>> GetDisplayNameLookup(int languageId)
         {
-            var allKeys = _displayNameResourceKeys.Select(x => x.Value);
+            var displayNames = await _cache.GetAsync("permission:displayname-" + languageId, async o =>
+            {
+                o.ExpiresIn(TimeSpan.FromDays(1));
 
-            var resources = await _db.LocaleStringResources
-                .AsNoTracking()
-                .Where(x => x.LanguageId == languageId && allKeys.Contains(x.ResourceName))
-                .ToListAsync();
+                var allKeys = _displayNameResourceKeys.Select(x => x.Value);
 
-            var resourcesLookup = resources.ToDictionarySafe(x => x.ResourceName, x => x.ResourceValue);
+                var resources = await _db.LocaleStringResources
+                    .AsNoTracking()
+                    .Where(x => x.LanguageId == languageId && 
+                        (x.ResourceName.StartsWith("Permissions.DisplayName.") || x.ResourceName.StartsWith("Plugins.Permissions.DisplayName.") || allKeys.Contains(x.ResourceName)) &&
+                        !string.IsNullOrEmpty(x.ResourceValue))
+                    .ToListAsync();
 
-            return resourcesLookup;
+                return resources.ToDictionarySafe(x => x.ResourceName, x => x.ResourceValue, StringComparer.OrdinalIgnoreCase);
+            });
+
+            return displayNames;
         }
 
         #endregion
